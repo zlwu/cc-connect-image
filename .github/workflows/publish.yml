@@ -1,0 +1,62 @@
+name: Publish Docker image
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit to build after an upstream-sync update.
+        required: true
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/cc-connect-image
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: Read component versions
+        id: versions
+        run: |
+          reasonix_version="$(awk -F= '/^ARG REASONIX_VERSION=/{print $2}' Dockerfile)"
+          cc_connect_version="$(awk -F= '/^ARG CC_CONNECT_VERSION=/{print $2}' Dockerfile)"
+          base_image_digest="$(sed -n 's/^FROM node:24-bookworm-slim@//p' Dockerfile)"
+          test -n "${reasonix_version}" && test -n "${cc_connect_version}" && test -n "${base_image_digest}"
+          echo "reasonix_version=${reasonix_version}" >> "$GITHUB_OUTPUT"
+          echo "cc_connect_version=${cc_connect_version}" >> "$GITHUB_OUTPUT"
+          echo "base_image_digest=${base_image_digest}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.versions.outputs.cc_connect_version }}
+            io.cc-connect.version=${{ steps.versions.outputs.cc_connect_version }}
+            io.reasonix.version=${{ steps.versions.outputs.reasonix_version }}
+            io.cc-connect.base-image.digest=${{ steps.versions.outputs.base_image_digest }}
+          tags: |
+            type=raw,value=main,enable={{is_default_branch}}
+            type=sha,format=short,prefix=sha-
+            type=ref,event=tag
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

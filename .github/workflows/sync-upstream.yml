@@ -1,0 +1,71 @@
+name: Sync upstream image components
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.update.outputs.changed }}
+      ref: ${{ steps.update.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Resolve and commit changed component versions
+        id: update
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          reasonix_version="$(curl -fsSL -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/esengine/DeepSeek-Reasonix/releases | node -e 'const rs=JSON.parse(require("fs").readFileSync(0,"utf8")); const r=rs.find(x=>/^v\\d+\\.\\d+\\.\\d+$/.test(x.tag_name)); if(!r)process.exit(1); process.stdout.write(r.tag_name.slice(1));')"
+          cc_connect_version="$(curl -fsSL -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/chenhg5/cc-connect/releases/latest | node -e 'const r=JSON.parse(require("fs").readFileSync(0,"utf8")); if(!/^v\\d+\\.\\d+\\.\\d+$/.test(r.tag_name))process.exit(1); process.stdout.write(r.tag_name.slice(1));')"
+          docker_token="$(curl -fsSL 'https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/node:pull' | node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0,"utf8")).token)')"
+          base_image_digest="$(curl -fsSI -H "Authorization: Bearer ${docker_token}" -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' https://registry-1.docker.io/v2/library/node/manifests/24-bookworm-slim | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest" {print $2}')"
+          test -n "${base_image_digest}"
+          REASONIX_VERSION="${reasonix_version}" CC_CONNECT_VERSION="${cc_connect_version}" BASE_IMAGE_DIGEST="${base_image_digest}" node -e '
+            const fs=require("fs"); let f=fs.readFileSync("Dockerfile","utf8");
+            f=f.replace(/^FROM node:24-bookworm-slim(?:@sha256:[a-f0-9]+)?$/m, `FROM node:24-bookworm-slim@${process.env.BASE_IMAGE_DIGEST}`);
+            f=f.replace(/^ARG REASONIX_VERSION=.*/m, `ARG REASONIX_VERSION=${process.env.REASONIX_VERSION}`);
+            f=f.replace(/^ARG CC_CONNECT_VERSION=.*/m, `ARG CC_CONNECT_VERSION=${process.env.CC_CONNECT_VERSION}`);
+            fs.writeFileSync("Dockerfile",f);'
+          if git diff --quiet -- Dockerfile; then echo "changed=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          git diff --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Dockerfile && git commit -m "chore: sync upstream image components" && git push
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+  publish:
+    needs: sync
+    if: needs.sync.outputs.changed == 'true'
+    uses: ./.github/workflows/publish.yml
+    with:
+      ref: ${{ needs.sync.outputs.ref }}
+    secrets: inherit
+  cleanup:
+    needs: [sync, publish]
+    if: always() && needs.sync.result == 'success' && (needs.publish.result == 'success' || needs.publish.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Delete expired GHCR image versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RETENTION_DAYS: "30"
+        run: |
+          cutoff_epoch="$(date -u -d "${RETENTION_DAYS} days ago" +%s)"
+          gh api --paginate "/users/${GITHUB_REPOSITORY_OWNER}/packages/container/cc-connect-image/versions?per_page=100" > /tmp/package-versions.json
+          jq -sr --argjson cutoff_epoch "${cutoff_epoch}" 'add[] | select((.updated_at | fromdateiso8601) < $cutoff_epoch) | select((((.metadata.container.tags // []) | index("main")) | not)) | .id' /tmp/package-versions.json | while read -r version_id; do
+            [ -n "${version_id}" ] && gh api --method DELETE "/users/${GITHUB_REPOSITORY_OWNER}/packages/container/cc-connect-image/versions/${version_id}"
+          done
